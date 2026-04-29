@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Generated intermediate files (may contain vendor spend data)
+vendors_raw.csv
+vendors_researched.json
+vendors_classified.json
+vendors_qa.json
+vendors_insights.json
+
+# Output
+VendorAnalysis_Output.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
