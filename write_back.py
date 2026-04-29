@@ -1,5 +1,16 @@
 """
-write_back.py — Write classification results back to the source Google Sheet.
+write_back.py — Write all analysis results back to the source Google Sheet,
+and create a Google Doc for the executive memo.
+
+Updates four tabs:
+  1. Vendor Analysis     — fills Department, Description, Suggestion columns
+  2. Top 3 Opportunities — writes opportunity titles, descriptions, savings
+  3. Methodology         — writes pipeline documentation and QA stats
+  4. Recommendations     — writes a link to the Google Doc memo
+
+Also creates:
+  • A Google Doc containing the full 1-page executive memo
+  • Sets the doc to "anyone with link can view"
 
 Requires Google credentials. Two auth methods are supported:
 
@@ -13,53 +24,51 @@ Requires Google credentials. Two auth methods are supported:
     1. Go to console.cloud.google.com → APIs → Credentials → OAuth 2.0 Client ID
     2. Download as credentials.json
     3. Set: export GOOGLE_CREDENTIALS_FILE=/path/to/credentials.json
-    4. First run will open a browser for authorization; token saved to token.json
-
-The sheet must have these columns (auto-detected by header name):
-  - Vendor Name
-  - Department
-  - Last 12 months Cost (USD)  [read-only]
-  - 1-line Description on what the Vendor does
-  - Suggestions (Consolidate / Terminate / Optimize costs)
+    4. First run opens browser for authorization; token saved to token.json
+    5. Add your Gmail as a test user on the OAuth consent screen first
 """
 from __future__ import annotations
 
 import json
 import os
+import pickle
 import sys
+from datetime import date
 
 import gspread
-from google.oauth2.service_account import Credentials as ServiceCredentials
-from google.oauth2.credentials import Credentials as OAuthCredentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from gspread.utils import rowcol_to_a1
 from google.auth.transport.requests import Request
-import pickle
+from google.oauth2.credentials import Credentials as OAuthCredentials
+from google.oauth2.service_account import Credentials as ServiceCredentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build as build_service
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file",
+]
 TOKEN_CACHE = "token.pickle"
 
-# Columns we write to — matched by header text, not position
-WRITABLE_COLUMNS = {
-    "department":        ["department"],
-    "description":       ["1-line description", "description on what", "vendor does"],
-    "recommendation":    ["suggestions", "consolidate", "terminate", "optimize"],
+# Tab name patterns — matched case-insensitively against the actual sheet names
+TAB_PATTERNS = {
+    "vendors":       ["vendor", "spend", "ledger"],
+    "opportunities": ["opportunit", "top 3", "top3"],
+    "methodology":   ["method"],
+    "memo":          ["recommend", "memo", "executive"],
 }
 
 
-def _get_credentials() -> ServiceCredentials | OAuthCredentials:
-    """
-    Returns Google credentials from the GOOGLE_CREDENTIALS_FILE env var.
-    Tries service account first; falls back to OAuth flow.
-    """
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def _get_credentials():
     creds_path = os.environ.get("GOOGLE_CREDENTIALS_FILE", "")
     if not creds_path:
         print(
             "\nERROR: GOOGLE_CREDENTIALS_FILE is not set.\n"
             "Set it to the path of your Google credentials JSON file.\n"
-            "See write_back.py module docstring for setup instructions.\n"
         )
         sys.exit(1)
-
     if not os.path.exists(creds_path):
         print(f"\nERROR: Credentials file not found: {creds_path}\n")
         sys.exit(1)
@@ -67,11 +76,10 @@ def _get_credentials() -> ServiceCredentials | OAuthCredentials:
     with open(creds_path) as f:
         creds_data = json.load(f)
 
-    # Service account credentials have a "type" field
     if creds_data.get("type") == "service_account":
         return ServiceCredentials.from_service_account_file(creds_path, scopes=SCOPES)
 
-    # OAuth credentials — check for cached token first
+    # OAuth — try cached token first
     if os.path.exists(TOKEN_CACHE):
         with open(TOKEN_CACHE, "rb") as f:
             creds = pickle.load(f)
@@ -83,7 +91,6 @@ def _get_credentials() -> ServiceCredentials | OAuthCredentials:
                 pickle.dump(creds, f)
             return creds
 
-    # First-time OAuth: open browser for authorization
     flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
     creds = flow.run_local_server(port=0)
     with open(TOKEN_CACHE, "wb") as f:
@@ -91,44 +98,321 @@ def _get_credentials() -> ServiceCredentials | OAuthCredentials:
     return creds
 
 
-def _detect_column_indices(header_row: list[str]) -> dict[str, int]:
-    """
-    Finds the column index (0-based) for each writable field by matching
-    header text against known patterns. Raises SystemExit if required
-    columns can't be found.
-    """
-    lower_headers = [h.lower() for h in header_row]
-    found = {}
+def _find_worksheet(spreadsheet: gspread.Spreadsheet, patterns: list[str]):
+    """Returns the first worksheet whose title matches any of the patterns."""
+    for ws in spreadsheet.worksheets():
+        title_lower = ws.title.lower()
+        if any(p in title_lower for p in patterns):
+            return ws
+    return None
 
-    for field, patterns in WRITABLE_COLUMNS.items():
-        for i, h in enumerate(lower_headers):
-            if any(p in h for p in patterns):
-                found[field] = i
-                break
 
-    missing = [f for f in WRITABLE_COLUMNS if f not in found]
-    if missing:
-        print(
-            f"\nERROR: Could not find columns for: {missing}\n"
-            f"Headers detected: {header_row}\n"
+# ── Google Doc memo creation ──────────────────────────────────────────────────
+
+def _build_memo_text(insights: dict) -> str:
+    """Assembles the full memo as plain text for insertion into a Google Doc."""
+    memo = insights.get("executive_memo", {})
+    opps = insights.get("opportunities", [])
+    total_low  = sum(o.get("savings_low_usd",  0) for o in opps[:3])
+    total_high = sum(o.get("savings_high_usd", 0) for o in opps[:3])
+
+    lines = [
+        "MEMORANDUM",
+        "",
+        f"TO:      {memo.get('to', 'Chief Executive Officer, Chief Financial Officer')}",
+        f"FROM:    {memo.get('from', 'VP of Operations')}",
+        f"DATE:    {memo.get('date', insights.get('analysis_date', date.today().isoformat()))}",
+        f"RE:      {memo.get('subject', 'Vendor Spend Analysis — Strategic Cost Reduction')}",
+        "",
+        "─" * 60,
+        "",
+        "EXECUTIVE SUMMARY",
+        "",
+        memo.get("executive_summary", ""),
+        "",
+        "─" * 60,
+        "",
+        "STRATEGIC OPPORTUNITIES",
+    ]
+
+    for opp in opps[:3]:
+        savings_low  = opp.get("savings_low_usd",  0)
+        savings_high = opp.get("savings_high_usd", 0)
+        lines += [
+            "",
+            f"{opp.get('rank', '')}. {opp.get('title', '')}",
+            f"   Est. Annual Savings: ${savings_low:,.0f} – ${savings_high:,.0f}",
+            "",
+            f"   {opp.get('description', '')}",
+        ]
+        if opp.get("implementation_steps"):
+            lines += ["", f"   Implementation: {opp['implementation_steps']}"]
+        if opp.get("risks"):
+            lines += [f"   Risks: {opp['risks']}"]
+        if opp.get("timeline"):
+            lines += [f"   Timeline: {opp['timeline']}"]
+
+    lines += [
+        "",
+        "─" * 60,
+        "",
+        "DEPARTMENT HIGHLIGHTS",
+        "",
+        memo.get("department_highlights", ""),
+        "",
+        "─" * 60,
+        "",
+        "RECOMMENDED IMMEDIATE ACTIONS (30-Day Sprint)",
+        "",
+        memo.get("immediate_actions", ""),
+        "",
+        "─" * 60,
+        "",
+        f"TOTAL ESTIMATED ANNUAL SAVINGS:  ${total_low:,.0f} – ${total_high:,.0f}",
+        "",
+        memo.get("total_savings_statement", ""),
+    ]
+
+    return "\n".join(lines)
+
+
+def _create_memo_doc(creds, insights: dict) -> str:
+    """
+    Creates a Google Doc containing the executive memo.
+    Sets it to 'anyone with link can view'.
+    Returns the doc URL.
+    """
+    memo = insights.get("executive_memo", {})
+    analysis_date = insights.get("analysis_date", date.today().isoformat())
+    doc_title = f"Executive Memo — Vendor Spend Analysis ({analysis_date})"
+    memo_text = _build_memo_text(insights)
+
+    # Create the document
+    docs_service = build_service("docs", "v1", credentials=creds)
+    doc = docs_service.documents().create(body={"title": doc_title}).execute()
+    doc_id = doc["documentId"]
+
+    # Insert the memo text
+    docs_service.documents().batchUpdate(
+        documentId=doc_id,
+        body={
+            "requests": [
+                {
+                    "insertText": {
+                        "location": {"index": 1},
+                        "text": memo_text,
+                    }
+                }
+            ]
+        },
+    ).execute()
+
+    # Set to "anyone with link can view"
+    drive_service = build_service("drive", "v3", credentials=creds)
+    drive_service.permissions().create(
+        fileId=doc_id,
+        body={"type": "anyone", "role": "reader"},
+    ).execute()
+
+    doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+    return doc_url
+
+
+# ── Tab writers ───────────────────────────────────────────────────────────────
+
+def _write_vendors_tab(ws, vendors: list[dict], classifications: list[dict]) -> None:
+    """Fills Department, Description, and Suggestion columns on the vendor tab."""
+    all_values = ws.get_all_values()
+    if not all_values:
+        print("  WARNING: Vendor tab appears empty — skipping.")
+        return
+
+    header = [h.lower() for h in all_values[0]]
+
+    def find_col(keywords):
+        for i, h in enumerate(header):
+            if any(k in h for k in keywords):
+                return i
+        return None
+
+    dept_col = find_col(["department"])
+    desc_col = find_col(["description", "what the vendor", "vendor does"])
+    rec_col  = find_col(["suggestion", "consolidate", "terminate", "optimize"])
+
+    if None in (dept_col, desc_col, rec_col):
+        print(f"  WARNING: Could not find all target columns in vendor tab. Headers: {all_values[0]}")
+        return
+
+    class_map = {c["vendor_name"].lower().strip(): c for c in classifications}
+    updates = []
+    matched, skipped = 0, 0
+
+    for row_num, row in enumerate(all_values[1:], start=2):
+        raw_name = row[0] if row else ""
+        c = class_map.get(raw_name.lower().strip())
+        if not c:
+            skipped += 1
+            continue
+        updates += [
+            {"range": rowcol_to_a1(row_num, dept_col + 1), "values": [[c.get("department", "")]]},
+            {"range": rowcol_to_a1(row_num, desc_col + 1), "values": [[c.get("description", "")]]},
+            {"range": rowcol_to_a1(row_num, rec_col  + 1), "values": [[c.get("recommendation", "")]]},
+        ]
+        matched += 1
+
+    if updates:
+        ws.batch_update(updates, value_input_option="RAW")
+    print(f"  Vendor tab: {matched} rows updated, {skipped} skipped (encoding mismatch).")
+
+
+def _write_opportunities_tab(ws, insights: dict) -> None:
+    """Writes Top 3 opportunities as a clean table."""
+    opps = insights.get("opportunities", [])
+    if not opps:
+        print("  WARNING: No opportunities in insights — skipping tab.")
+        return
+
+    ws.clear()
+
+    rows = [["#", "Opportunity", "Description", "Affected Vendors",
+             "Current Spend (USD)", "Est. Savings Low (USD)", "Est. Savings High (USD)",
+             "Timeline", "Risks"]]
+
+    for opp in opps[:3]:
+        rows.append([
+            opp.get("rank", ""),
+            opp.get("title", ""),
+            opp.get("description", "") + ("\n\nActions: " + opp["implementation_steps"] if opp.get("implementation_steps") else ""),
+            ", ".join(opp.get("affected_vendors", [])),
+            opp.get("current_spend_usd", ""),
+            opp.get("savings_low_usd", ""),
+            opp.get("savings_high_usd", ""),
+            opp.get("timeline", ""),
+            opp.get("risks", ""),
+        ])
+
+    total_low  = sum(o.get("savings_low_usd",  0) for o in opps[:3])
+    total_high = sum(o.get("savings_high_usd", 0) for o in opps[:3])
+    rows.append(["", "COMBINED SAVINGS", "", "", "", total_low, total_high, "", ""])
+
+    ws.update(rows, value_input_option="RAW")
+    print(f"  Opportunities tab: {len(opps[:3])} opportunities written.")
+
+
+def _write_methodology_tab(ws, insights: dict, qa_report: dict | None) -> None:
+    """Writes methodology documentation as labelled rows."""
+    ws.clear()
+
+    qa_ok      = qa_report.get("ok",           "N/A") if qa_report else "N/A"
+    qa_warn    = qa_report.get("warn",          "N/A") if qa_report else "N/A"
+    qa_err     = qa_report.get("error",         "N/A") if qa_report else "N/A"
+    qa_reclass = qa_report.get("reclassified",  "N/A") if qa_report else "N/A"
+
+    dept_summary = "\n".join(
+        f"{d['department']}: {d['vendor_count']} vendors, ${d['total_spend']:,.0f}"
+        for d in sorted(
+            insights.get("department_summary", []),
+            key=lambda x: x.get("total_spend", 0), reverse=True
         )
-        sys.exit(1)
+    )
 
-    return found
+    rows = [
+        ["VENDOR SPEND ANALYSIS — METHODOLOGY", ""],
+        ["", ""],
+        ["Overview", f"Analysis of {insights.get('total_vendors', '')} vendors "
+                     f"totalling ${insights.get('total_spend_usd', 0):,.0f} TTM spend. "
+                     f"Analysis date: {insights.get('analysis_date', '')}."],
+        ["", ""],
+        ["Pipeline", ""],
+        ["1 — Fetch",     "Downloaded AP ledger via Google Sheets CSV export. Auto-detects name and spend columns."],
+        ["2 — Research",  "Claude training-knowledge pass for all vendors (batches of 50). "
+                          "LOW-confidence vendors above $20K spend received a DuckDuckGo web lookup. "
+                          "Results cached to vendors_researched.json."],
+        ["3 — Classify",  "Claude API classification with prompt caching (cache_control: ephemeral) on system prompt. "
+                          "Saves ~85% of input tokens after batch 1. Batch size 50. Crash recovery after each batch."],
+        ["4 — QA Review", "Second Claude pass reviews every classification as a senior procurement auditor. "
+                          "Criteria: department fit, description quality, recommendation consistency, factual accuracy. "
+                          "Error-flagged vendors automatically re-classified with QA feedback as context."],
+        ["5 — Synthesize","Claude analyzes full classified dataset and generates Top 3 opportunities "
+                          "and executive memo from actual data. No hardcoded outputs."],
+        ["", ""],
+        ["QA Statistics", ""],
+        ["Passed (ok)",           str(qa_ok)],
+        ["Warnings (warn)",       str(qa_warn)],
+        ["Errors flagged",        str(qa_err)],
+        ["Re-classified",         str(qa_reclass)],
+        ["", ""],
+        ["Recommendation Framework", ""],
+        ["Terminate",    "No recurring business value; one-off purchases; spend <$500 with no recurring purpose; or duplicate entry."],
+        ["Consolidate",  "Overlapping service with another vendor on the list — both flagged, duplicate named in note."],
+        ["Optimize",     "Strategic vendor with high spend relative to market — renegotiate, right-size, or seek volume discounts."],
+        ["", ""],
+        ["Spend by Department", dept_summary],
+        ["", ""],
+        ["Tools",        "Python 3.9, anthropic SDK (claude-sonnet-4-6), openpyxl, gspread, google-api-python-client, DuckDuckGo Instant Answer API"],
+        ["", ""],
+        ["Limitations",  "1. No contract terms or seat data available — savings estimates based on benchmarks.\n"
+                         "2. Spend figures are AP payments; may differ from contracted amounts.\n"
+                         "3. Some vendor names contain encoding artifacts (Croatian characters) — 7 vendors unclassified.\n"
+                         "4. Analysis does not cover vendor performance or SLA compliance."],
+    ]
 
+    ws.update(rows, value_input_option="RAW")
+    print(f"  Methodology tab: written.")
+
+
+def _write_memo_tab(ws, insights: dict, doc_url: str) -> None:
+    """Writes a reference to the Google Doc memo in the Recommendations tab."""
+    ws.clear()
+
+    memo = insights.get("executive_memo", {})
+    analysis_date = insights.get("analysis_date", date.today().isoformat())
+    opps = insights.get("opportunities", [])
+    total_low  = sum(o.get("savings_low_usd",  0) for o in opps[:3])
+    total_high = sum(o.get("savings_high_usd", 0) for o in opps[:3])
+
+    rows = [
+        ["EXECUTIVE MEMO"],
+        [""],
+        ["The full 1-page executive memo is in the linked Google Doc below."],
+        [""],
+        ["Memo (Google Doc)", doc_url],
+        [""],
+        ["Date",    analysis_date],
+        ["To",      memo.get("to", "Chief Executive Officer, Chief Financial Officer")],
+        ["From",    memo.get("from", "VP of Operations")],
+        ["Subject", memo.get("subject", "Vendor Spend Analysis — Strategic Cost Reduction")],
+        [""],
+        ["Executive Summary"],
+        [memo.get("executive_summary", "")],
+        [""],
+        ["Total Estimated Annual Savings", f"${total_low:,.0f} – ${total_high:,.0f}"],
+    ]
+
+    ws.update(rows, value_input_option="RAW")
+    print(f"  Recommendations tab: memo link written → {doc_url}")
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def write_back(
     sheets_id: str,
     vendors: list[dict],
     classifications: list[dict],
+    insights: dict | None = None,
+    qa_report: dict | None = None,
 ) -> None:
     """
-    Updates the Department, Description, and Suggestion columns in the
-    Google Sheet for every vendor that has a classification.
+    Writes all analysis results back to the Google Sheet and creates a Google Doc memo.
 
-    Uses batch updates (single API call per sheet) to minimize quota usage.
-    Vendors with encoding mismatches that can't be matched are skipped and
-    reported at the end.
+    Updates all four tabs:
+      1. Vendor Analysis     — fills Department, Description, Suggestion columns
+      2. Top 3 Opportunities — writes opportunity table with savings figures
+      3. Methodology         — writes pipeline docs and QA statistics
+      4. Recommendations     — writes link to the Google Doc executive memo
+
+    Also creates a Google Doc with the full executive memo and sets it to
+    "anyone with link can view".
     """
     print(f"  Authenticating with Google Sheets...")
     creds = _get_credentials()
@@ -136,68 +420,38 @@ def write_back(
 
     print(f"  Opening sheet: {sheets_id}")
     spreadsheet = client.open_by_key(sheets_id)
-    worksheet = spreadsheet.get_worksheet(0)
+    sheet_titles = [ws.title for ws in spreadsheet.worksheets()]
+    print(f"  Tabs found: {sheet_titles}")
 
-    all_values = worksheet.get_all_values()
-    if not all_values:
-        print("ERROR: Sheet appears to be empty.")
-        sys.exit(1)
+    # Vendor tab
+    ws = _find_worksheet(spreadsheet, TAB_PATTERNS["vendors"])
+    if ws:
+        _write_vendors_tab(ws, vendors, classifications)
+    else:
+        print("  WARNING: Could not find vendor tab — skipping.")
 
-    header_row = all_values[0]
-    col_idx = _detect_column_indices(header_row)
+    if insights:
+        # Opportunities tab
+        ws = _find_worksheet(spreadsheet, TAB_PATTERNS["opportunities"])
+        if ws:
+            _write_opportunities_tab(ws, insights)
+        else:
+            print("  WARNING: Could not find Top 3 Opportunities tab — skipping.")
 
-    dept_col = col_idx["department"]
-    desc_col = col_idx["description"]
-    rec_col  = col_idx["recommendation"]
+        # Methodology tab
+        ws = _find_worksheet(spreadsheet, TAB_PATTERNS["methodology"])
+        if ws:
+            _write_methodology_tab(ws, insights, qa_report)
+        else:
+            print("  WARNING: Could not find Methodology tab — skipping.")
 
-    # Build a lookup: vendor name (lowercase, stripped) → classification
-    class_map = {
-        c["vendor_name"].lower().strip(): c
-        for c in classifications
-    }
-
-    # Prepare batch update cells
-    updates = []
-    matched = 0
-    skipped = []
-
-    for row_num, row in enumerate(all_values[1:], start=2):  # 1-based, skip header
-        if not row:
-            continue
-        raw_name = row[0] if row else ""
-        name_key = raw_name.lower().strip()
-
-        c = class_map.get(name_key)
-        if not c:
-            skipped.append(raw_name)
-            continue
-
-        # gspread uses (row, col) with 1-based columns
-        updates.append({
-            "range": gspread.utils.rowcol_to_a1(row_num, dept_col + 1),
-            "values": [[c.get("department", "")]],
-        })
-        updates.append({
-            "range": gspread.utils.rowcol_to_a1(row_num, desc_col + 1),
-            "values": [[c.get("description", "")]],
-        })
-        updates.append({
-            "range": gspread.utils.rowcol_to_a1(row_num, rec_col + 1),
-            "values": [[c.get("recommendation", "")]],
-        })
-        matched += 1
-
-    if not updates:
-        print("  No rows matched — nothing written.")
-        return
-
-    print(f"  Writing {matched} rows ({len(updates)} cells) in a single batch...")
-    worksheet.batch_update(updates, value_input_option="RAW")
-
-    print(f"  Done. {matched} vendors updated in Google Sheets.")
-    if skipped:
-        print(f"  Skipped {len(skipped)} vendors (encoding mismatch or not in classifications):")
-        for name in skipped[:5]:
-            print(f"    {name}")
-        if len(skipped) > 5:
-            print(f"    ... and {len(skipped) - 5} more")
+        # Executive memo → Google Doc, then link in Recommendations tab
+        ws = _find_worksheet(spreadsheet, TAB_PATTERNS["memo"])
+        if ws:
+            print("  Creating executive memo Google Doc...")
+            doc_url = _create_memo_doc(creds, insights)
+            _write_memo_tab(ws, insights, doc_url)
+        else:
+            print("  WARNING: Could not find Recommendations tab — skipping.")
+    else:
+        print("  NOTE: No insights data — only vendor tab updated.")

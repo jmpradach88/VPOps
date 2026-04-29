@@ -6,11 +6,14 @@ produces a CEO/CFO-ready XLSX — in a single CLI run against any company's vend
 ## Setup
 
 ```bash
-pip install anthropic
+pip install anthropic gspread google-auth google-auth-oauthlib google-api-python-client
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 `openpyxl` and `requests` are included in standard Anaconda/Python installs.
+
+The Google Sheets/Docs packages (`gspread`, `google-auth`, `google-api-python-client`) are only
+required if you use the `--write-back` flag. The core analysis pipeline works without them.
 
 ## Usage
 
@@ -24,6 +27,11 @@ python3 analyze_vendors.py --input YOUR_SHEET_ID
 
 # Re-run and skip expensive stages using cached files
 python3 analyze_vendors.py --input vendors.csv --skip-research --skip-classify --skip-qa
+
+# Write results back to the source Google Sheet (requires GOOGLE_CREDENTIALS_FILE)
+# Also creates a Google Doc for the executive memo and links it in the Recommendations tab
+export GOOGLE_CREDENTIALS_FILE=/path/to/credentials.json
+python3 analyze_vendors.py --input YOUR_SHEET_ID --skip-research --skip-classify --skip-qa --skip-synthesis --write-back
 ```
 
 ## Input requirements
@@ -43,7 +51,7 @@ Column names are auto-detected — no preprocessing required.
 | Vendor Analysis | Every vendor: Department, Description, Recommendation, QA Flag |
 | Top 3 Opportunities | Highest-impact savings with $ estimates, actions, timeline |
 | Methodology | Pipeline docs, QA statistics, tools used, limitations |
-| Recommendations | Executive memo (CEO/CFO) with risks and 30-day sprint |
+| Recommendations | Link to Google Doc memo + summary (requires `--write-back`) |
 
 ## Pipeline
 

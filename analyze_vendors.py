@@ -196,7 +196,7 @@ def main() -> None:
         else:
             from write_back import write_back
             print("Writing results back to Google Sheets...")
-            write_back(sheets_id, vendors, classifications)
+            write_back(sheets_id, vendors, classifications, insights, qa_report)
 
     # ── Summary ───────────────────────────────────────────────────
     rec_dist = report["recommendation_distribution"]
