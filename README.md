@@ -3,6 +3,12 @@
 Classifies an AP vendor ledger, identifies Top 3 cost-reduction opportunities, and
 produces a CEO/CFO-ready XLSX — in a single CLI run against any company's vendor data.
 
+Built with the **Claude Code CLI** using the Anthropic SDK (`claude-sonnet-4-6`).
+All classification, QA review, and synthesis is performed programmatically via the API —
+no manual data entry.
+
+**Source data:** [Google Sheet AP ledger](https://docs.google.com/spreadsheets/d/1L2u8j-3cSFLPMXbbBljI4YYXQ9COYS5YihtBhxWTPls)
+
 ## Setup
 
 ```bash
@@ -49,9 +55,12 @@ Column names are auto-detected — no preprocessing required.
 | Tab | Contents |
 |-----|----------|
 | Vendor Analysis | Every vendor: Department, Description, Recommendation, QA Flag |
-| Top 3 Opportunities | Highest-impact savings with $ estimates, actions, timeline |
-| Methodology | Pipeline docs, QA statistics, tools used, limitations |
-| Recommendations | Link to Google Doc memo + summary (requires `--write-back`) |
+| Top 3 Opportunities | Highest-impact savings with $ estimates, affected vendors, timeline, risks |
+| Methodology | Pipeline docs, prompts used, QA evidence with re-classification examples |
+| Recommendations | Google Doc link (requires `--write-back`) |
+
+With `--write-back`, results are also written to the source Google Sheet and a
+one-page executive memo is created as a shared Google Doc (anyone with link can view).
 
 ## Pipeline
 
@@ -60,25 +69,42 @@ Fetch → Research → Classify → QA Review → Synthesize → Validate → Bu
 ```
 
 1. **Fetch** — loads CSV or Google Sheets, auto-detects columns
-2. **Research** — Claude knowledge pass per vendor; web lookup for low-confidence / high-spend vendors
-3. **Classify** — Claude API in batches of 50, prompt-cached; assigns department, description, recommendation
-4. **QA Review** — second Claude pass reviews every classification; auto re-classifies errors
-5. **Synthesize** — Claude generates Top 3 opportunities and executive memo from actual data
-6. **Validate** — deterministic checks (coverage, valid fields, high-spend flags)
+2. **Research** — Claude knowledge pass per vendor (batches of 50); DuckDuckGo web lookup for
+   low-confidence vendors above $20K spend
+3. **Classify** — Claude API with prompt caching (`cache_control: ephemeral`); assigns department,
+   one-line description, and Terminate / Consolidate / Optimize with justification note
+4. **QA Review** — second independent Claude pass audits every classification against four criteria:
+   department fit, description specificity, recommendation consistency, factual accuracy.
+   Errors trigger automatic re-classification with QA feedback injected as context.
+5. **Synthesize** — Claude analyzes the full classified dataset to generate Top 3 opportunities
+   and executive memo from actual data; no hardcoded outputs
+6. **Validate** — deterministic rule checks: 100% coverage, valid fields, Consolidate notes name
+   a target, high-spend Terminate flags surfaced for human review
 
 Estimated runtime: ~8 minutes for 400 vendors. Estimated API cost: ~$0.36.
 
 ## Files
 
 ```
-analyze_vendors.py      Entry point
-config.py               Constants (model, departments, thresholds)
-fetch_data.py           CSV / Sheets loader
-research_vendors.py     Vendor knowledge enrichment
-classify_vendors.py     Claude classification
-qa_review.py            AI QA pass
-synthesize_insights.py  Opportunities + exec memo generation
-build_output.py         XLSX builder
-validate_output.py      Quality checks
+analyze_vendors.py      Entry point — orchestrates all pipeline stages
+config.py               Constants: model, departments, thresholds, file paths
+fetch_data.py           CSV / Sheets loader; column auto-detection
+research_vendors.py     Vendor knowledge enrichment via Claude + DuckDuckGo
+classify_vendors.py     Claude classification with prompt caching + crash recovery
+qa_review.py            AI QA audit pass; auto re-classification of errors
+synthesize_insights.py  Top 3 opportunities + executive memo generation
+build_output.py         XLSX builder (4 tabs)
+validate_output.py      Deterministic rule-based quality checks
+write_back.py           Google Sheets write-back + Google Doc memo creation
 CLAUDE.md               Project guidelines for AI-assisted development
+```
+
+## Intermediate files (gitignored — may contain vendor spend data)
+
+```
+vendors_raw.csv             Raw AP data from source
+vendors_researched.json     Research cache
+vendors_classified.json     Classification cache (crash recovery)
+vendors_qa.json             QA results cache
+vendors_insights.json       Synthesized opportunities + memo cache
 ```

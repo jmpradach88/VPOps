@@ -77,7 +77,7 @@ system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephem
 Do not remove `cache_control`. It saves ~85% of input tokens from batch 2 onward.
 
 **Batch size is 50 for a reason.**
-50 vendors per call keeps output JSON reliably within the 4,096-token budget.
+50 vendors per call keeps output JSON reliably within the `MAX_TOKENS` (8,192) budget.
 Going higher risks truncation and wastes a full retry. Going lower doubles API calls.
 If you change `BATCH_SIZE`, test with a real run and document why.
 
@@ -102,11 +102,12 @@ to be meaningful. Running them as a final synthesis step (rather than inline dur
 classification) means Claude has the complete picture when it makes recommendations.
 It also makes the output fully data-driven and reusable.
 
-**Why not write back to Google Sheets directly?**
-The Google Drive MCP tools are available in this Claude Code session, but writing
-back to the source sheet introduces a dependency on session state and credentials.
-XLSX output is self-contained, portable, and auditable. If write-back is needed,
-it should be an explicit `--write-back` flag, not the default.
+**Why is write-back an opt-in flag rather than the default?**
+XLSX output is self-contained, portable, and auditable — it works without any
+Google credentials. Write-back (`--write-back`) requires OAuth or a service account,
+creates a live Google Doc, and makes network calls that can fail. Keeping it opt-in
+means the core analysis pipeline has no external credential dependency. The implementation
+lives in `write_back.py` and is never imported unless `--write-back` is passed.
 
 **Why DuckDuckGo for web lookups instead of a more capable search API?**
 DuckDuckGo Instant Answer is free, requires no API key, and is sufficient for
@@ -131,7 +132,7 @@ and resumes from the last completed batch. Do not remove this pattern.
 - If you add a new output column to the XLSX, add it in `build_output.py` only —
   do not add display logic to other modules.
 - Run `python3 -c "import config, fetch_data, research_vendors, classify_vendors,
-  qa_review, synthesize_insights, build_output, validate_output, analyze_vendors"`
+  qa_review, synthesize_insights, build_output, validate_output, write_back, analyze_vendors"`
   after any change to confirm all modules still import cleanly.
 
 ---
@@ -140,9 +141,10 @@ and resumes from the last completed batch. Do not remove this pattern.
 
 - Do not add hardcoded vendor names, spend amounts, or company-specific logic anywhere.
   The pipeline must remain reusable across any AP dataset.
-- Do not add a `requirements.txt` that pins transitive dependencies. The only hard
-  dependency is `anthropic`. Everything else (`openpyxl`, `requests`, `pandas`) ships
-  with standard Python environments.
+- Do not add a `requirements.txt` that pins transitive dependencies. Hard dependencies
+  are `anthropic` (core pipeline) and `gspread google-auth google-auth-oauthlib
+  google-api-python-client` (write-back only). Everything else (`openpyxl`, `requests`)
+  ships with standard Python environments. Keep install instructions in README only.
 - Do not change the batch-level JSON output format without updating the corresponding
   `_parse_response` function. Mismatched schemas are the most common source of bugs.
 - Do not use `print` for debugging and leave it in. Use it for user-facing progress
