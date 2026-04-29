@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import re
 import sys
 from datetime import date
 
@@ -119,6 +120,25 @@ def _find_col(header: list[str], keywords: list[str]) -> int | None:
         if any(k in h.lower() for k in keywords):
             return i
     return None
+
+
+def _ascii_key(name: str) -> str:
+    """Keep only ASCII alphanumeric chars, lowercase.
+
+    Used as a fallback match key so that vendor names with encoding artifacts
+    (e.g. mojibake like 'SveuÃ¤Â\\x8dIli') match their proper UTF-8 equivalents
+    ('Sveučili') returned by the Sheets API.
+    """
+    return re.sub(r'[^a-z0-9]', '', name.lower())
+
+
+def _ensure_grid(ws, rows_needed: int, cols_needed: int) -> None:
+    """Expand the worksheet grid if it is too small to hold the data."""
+    if ws.row_count < rows_needed or ws.col_count < cols_needed:
+        ws.resize(
+            rows=max(ws.row_count, rows_needed),
+            cols=max(ws.col_count, cols_needed),
+        )
 
 
 # ── Google Doc memo creation ──────────────────────────────────────────────────
@@ -237,13 +257,15 @@ def _write_vendors_tab(ws, vendors: list[dict], classifications: list[dict]) -> 
         print(f"  WARNING: Could not find all target columns in vendor tab. Headers: {header}")
         return
 
-    class_map = {c["vendor_name"].lower().strip(): c for c in classifications}
+    class_map      = {c["vendor_name"].lower().strip(): c for c in classifications}
+    ascii_class_map = {_ascii_key(c["vendor_name"]): c for c in classifications}
     updates = []
     matched, skipped = 0, 0
 
     for row_num, row in enumerate(all_values[1:], start=2):
         raw_name = row[0] if row else ""
-        c = class_map.get(raw_name.lower().strip())
+        c = class_map.get(raw_name.lower().strip()) \
+            or ascii_class_map.get(_ascii_key(raw_name))
         if not c:
             skipped += 1
             continue
@@ -313,6 +335,14 @@ def _write_opportunities_tab(ws, insights: dict) -> None:
         updates.append({"range": rowcol_to_a1(summary_row, high_col + 1), "values": [[total_high]]})
 
     if updates:
+        rows_needed = len(opps[:3]) + 2          # header + data rows + summary row
+        cols_needed = max(
+            (c for c in [rank_col, title_col, desc_col, vendor_col,
+                         spend_col, low_col, high_col, timeline_col, risks_col]
+             if c is not None),
+            default=0,
+        ) + 1
+        _ensure_grid(ws, rows_needed, cols_needed)
         ws.batch_update(updates, value_input_option="RAW")
     print(f"  Opportunities tab: {len(opps[:3])} opportunities written.")
 
@@ -410,6 +440,7 @@ def _write_methodology_tab(ws, insights: dict, qa_report: dict | None) -> None:
         updates.append({"range": rowcol_to_a1(row_num, value_col + 1), "values": [[value]]})
 
     if updates:
+        _ensure_grid(ws, next_empty_row - 1, value_col + 1)
         ws.batch_update(updates, value_input_option="RAW")
     print(f"  Methodology tab: written.")
 
@@ -464,6 +495,7 @@ def _write_memo_tab(ws, insights: dict, doc_url: str) -> None:
         updates.append({"range": rowcol_to_a1(row_num, value_col + 1), "values": [[value]]})
 
     if updates:
+        _ensure_grid(ws, next_empty_row - 1, value_col + 1)
         ws.batch_update(updates, value_input_option="RAW")
     print(f"  Recommendations tab: memo link written → {doc_url}")
 
