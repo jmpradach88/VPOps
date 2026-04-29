@@ -344,104 +344,128 @@ def _write_opportunities_tab(ws, insights: dict) -> None:
         ) + 1
         _ensure_grid(ws, rows_needed, cols_needed)
         ws.batch_update(updates, value_input_option="RAW")
+
+    # Wrap text in column C and auto-resize those rows so content is fully visible
+    if desc_col is not None:
+        data_rows = len(opps[:3])
+        col_letter = chr(ord('A') + desc_col)
+        ws.format(
+            f"{col_letter}2:{col_letter}{data_rows + 1}",
+            {"wrapStrategy": "WRAP"},
+        )
+        ws.spreadsheet.batch_update({
+            "requests": [{
+                "autoResizeDimensions": {
+                    "dimensions": {
+                        "sheetId": ws.id,
+                        "dimension": "ROWS",
+                        "startIndex": 1,            # row 2 = index 1
+                        "endIndex": data_rows + 1,  # up to and including last data row
+                    }
+                }
+            }]
+        })
+
     print(f"  Opportunities tab: {len(opps[:3])} opportunities written.")
 
 
-def _write_methodology_tab(ws, insights: dict, qa_report: dict | None) -> None:
-    """Fills methodology data into the existing structure of the Methodology tab."""
-    all_values = ws.get_all_values()
-    if not all_values:
-        print("  WARNING: Methodology tab appears empty — skipping.")
-        return
-
-    header = all_values[0]
-    # Detect which column holds labels and which holds values
-    label_col = _find_col(header, ["section", "label", "item", "step", "area"])
-    value_col = _find_col(header, ["detail", "description", "value", "content", "notes"])
-
-    # Fall back: assume col A = labels, col B = values
-    if label_col is None:
-        label_col = 0
-    if value_col is None:
-        value_col = 1
-
+def _build_methodology_text(insights: dict, qa_report: dict | None) -> str:
+    """Builds the full methodology content as a single plain-text block for cell A2."""
     qa_ok      = qa_report.get("ok",          "N/A") if qa_report else "N/A"
     qa_warn    = qa_report.get("warn",         "N/A") if qa_report else "N/A"
     qa_err     = qa_report.get("error",        "N/A") if qa_report else "N/A"
     qa_reclass = qa_report.get("reclassified", "N/A") if qa_report else "N/A"
 
-    dept_summary = "\n".join(
-        f"{d['department']}: {d['vendor_count']} vendors, ${d['total_spend']:,.0f}"
+    dept_lines = "\n".join(
+        f"  {d['department']}: {d['vendor_count']} vendors, ${d['total_spend']:,.0f}"
         for d in sorted(
             insights.get("department_summary", []),
-            key=lambda x: x.get("total_spend", 0), reverse=True
+            key=lambda x: x.get("total_spend", 0), reverse=True,
         )
     )
 
-    content_rows = [
-        ("Overview",
-         f"Analysis of {insights.get('total_vendors', '')} vendors "
-         f"totalling ${insights.get('total_spend_usd', 0):,.0f} TTM spend. "
-         f"Analysis date: {insights.get('analysis_date', '')}."),
-        ("1 — Fetch",
-         "Downloaded AP ledger via Google Sheets CSV export. Auto-detects name and spend columns."),
-        ("2 — Research",
-         "Claude training-knowledge pass for all vendors (batches of 50). "
-         "LOW-confidence vendors above $20K spend received a DuckDuckGo web lookup. "
-         "Results cached to vendors_researched.json."),
-        ("3 — Classify",
-         "Claude API classification with prompt caching (cache_control: ephemeral). "
-         "Saves ~85% of input tokens after batch 1. Batch size 50. Crash recovery after each batch."),
-        ("4 — QA Review",
-         "Second Claude pass reviews every classification as a senior procurement auditor. "
-         "Criteria: department fit, description quality, recommendation consistency, factual accuracy. "
-         "Error-flagged vendors automatically re-classified with QA feedback as context."),
-        ("5 — Synthesize",
-         "Claude analyzes full classified dataset and generates Top 3 opportunities "
-         "and executive memo from actual data. No hardcoded outputs."),
-        ("QA: Passed",       str(qa_ok)),
-        ("QA: Warnings",     str(qa_warn)),
-        ("QA: Errors",       str(qa_err)),
-        ("QA: Re-classified",str(qa_reclass)),
-        ("Terminate",
-         "No recurring business value; one-off purchases; spend <$500 with no recurring purpose; or duplicate entry."),
-        ("Consolidate",
-         "Overlapping service with another vendor on the list — both flagged, duplicate named in note."),
-        ("Optimize",
-         "Strategic vendor with high spend relative to market — renegotiate, right-size, or seek volume discounts."),
-        ("Spend by Department", dept_summary),
-        ("Tools",
-         "Python 3.9, anthropic SDK (claude-sonnet-4-6), openpyxl, gspread, google-api-python-client, DuckDuckGo Instant Answer API"),
-        ("Limitations",
-         "1. No contract terms or seat data available — savings estimates based on benchmarks.\n"
-         "2. Spend figures are AP payments; may differ from contracted amounts.\n"
-         "3. Some vendor names contain encoding artifacts — a small number of vendors unclassified.\n"
-         "4. Analysis does not cover vendor performance or SLA compliance."),
-    ]
+    return (
+        f"OVERVIEW\n"
+        f"Analysis of {insights.get('total_vendors', '')} vendors totalling "
+        f"${insights.get('total_spend_usd', 0):,.0f} TTM spend. "
+        f"Analysis date: {insights.get('analysis_date', '')}.\n"
+        f"\n"
+        f"PIPELINE\n"
+        f"1 — Fetch: Downloaded AP ledger via Google Sheets CSV export. "
+        f"Auto-detects name and spend columns.\n"
+        f"\n"
+        f"2 — Research: Claude training-knowledge pass for all vendors (batches of 50). "
+        f"LOW-confidence vendors above $20K spend received a DuckDuckGo web lookup. "
+        f"Results cached to vendors_researched.json.\n"
+        f"\n"
+        f"3 — Classify: Claude API classification with prompt caching "
+        f"(cache_control: ephemeral) on system prompt. Saves ~85% of input tokens "
+        f"after batch 1. Batch size 50. Crash recovery after each batch.\n"
+        f"\n"
+        f"4 — QA Review: Second Claude pass reviews every classification as a senior "
+        f"procurement auditor. Criteria: department fit, description quality, "
+        f"recommendation consistency, factual accuracy. Error-flagged vendors "
+        f"automatically re-classified with QA feedback as context.\n"
+        f"\n"
+        f"5 — Synthesize: Claude analyzes the full classified dataset and generates "
+        f"Top 3 opportunities and executive memo from actual data. No hardcoded outputs.\n"
+        f"\n"
+        f"QA STATISTICS\n"
+        f"  Passed (ok):      {qa_ok}\n"
+        f"  Warnings:         {qa_warn}\n"
+        f"  Errors flagged:   {qa_err}\n"
+        f"  Re-classified:    {qa_reclass}\n"
+        f"\n"
+        f"RECOMMENDATION FRAMEWORK\n"
+        f"  Terminate   — No recurring business value; one-off purchases; spend <$500 "
+        f"with no recurring purpose; or duplicate entry.\n"
+        f"  Consolidate — Overlapping service with another vendor on the list — "
+        f"both flagged, duplicate named in note.\n"
+        f"  Optimize    — Strategic vendor with high spend relative to market — "
+        f"renegotiate, right-size, or seek volume discounts.\n"
+        f"\n"
+        f"SPEND BY DEPARTMENT\n"
+        f"{dept_lines}\n"
+        f"\n"
+        f"TOOLS\n"
+        f"  Python 3.9, anthropic SDK (claude-sonnet-4-6), openpyxl, gspread, "
+        f"google-api-python-client, DuckDuckGo Instant Answer API\n"
+        f"\n"
+        f"LIMITATIONS\n"
+        f"  1. No contract terms or seat data available — savings estimates based on benchmarks.\n"
+        f"  2. Spend figures are AP payments; may differ from contracted amounts.\n"
+        f"  3. Some vendor names contain encoding artifacts — a small number unclassified.\n"
+        f"  4. Analysis does not cover vendor performance or SLA compliance."
+    )
 
-    # Match existing label rows if they exist, otherwise append
-    existing_labels = {
-        row[label_col].strip().lower(): row_num + 1
-        for row_num, row in enumerate(all_values[1:], start=1)
-        if len(row) > label_col and row[label_col].strip()
-    }
 
-    updates = []
-    next_empty_row = len(all_values) + 1
+def _write_methodology_tab(ws, insights: dict, qa_report: dict | None) -> None:
+    """Writes all methodology content into cell A2 as a single wrapped text block.
 
-    for label, value in content_rows:
-        matched_row = existing_labels.get(label.lower())
-        if matched_row:
-            row_num = matched_row
-        else:
-            row_num = next_empty_row
-            next_empty_row += 1
-            updates.append({"range": rowcol_to_a1(row_num, label_col + 1), "values": [[label]]})
-        updates.append({"range": rowcol_to_a1(row_num, value_col + 1), "values": [[value]]})
+    Row 1 (the header) is left untouched to preserve existing formatting.
+    A2 is set to wrap text and the row is auto-resized to fit the content.
+    """
+    _ensure_grid(ws, 2, 1)
 
-    if updates:
-        _ensure_grid(ws, next_empty_row - 1, value_col + 1)
-        ws.batch_update(updates, value_input_option="RAW")
+    text = _build_methodology_text(insights, qa_report)
+    ws.update("A2", [[text]], value_input_option="RAW")
+
+    # Enable text wrap on A2
+    ws.format("A2", {"wrapStrategy": "WRAP"})
+
+    # Auto-resize row 2 to fit the content
+    ws.spreadsheet.batch_update({
+        "requests": [{
+            "autoResizeDimensions": {
+                "dimensions": {
+                    "sheetId": ws.id,
+                    "dimension": "ROWS",
+                    "startIndex": 1,   # 0-indexed; row 2 = index 1
+                    "endIndex": 2,
+                }
+            }
+        }]
+    })
     print(f"  Methodology tab: written.")
 
 
