@@ -75,29 +75,32 @@ def _get_credentials():
         print(f"\nERROR: Credentials file not found: {creds_path}\n")
         sys.exit(1)
 
+    required_scopes = set(SCOPES)
+
+    # Always try a cached OAuth token first — it may exist even when the
+    # credentials file is a service account (e.g. from a prior OAuth run).
+    if os.path.exists(TOKEN_CACHE):
+        with open(TOKEN_CACHE, "rb") as f:
+            creds = pickle.load(f)
+        token_scopes = set(creds.scopes or [])
+        if creds.valid and required_scopes.issubset(token_scopes):
+            return creds
+        if creds.expired and creds.refresh_token and required_scopes.issubset(token_scopes):
+            creds.refresh(Request())
+            with open(TOKEN_CACHE, "wb") as f:
+                pickle.dump(creds, f)
+            return creds
+        # Stale or missing scopes — delete and fall through to re-auth
+        os.remove(TOKEN_CACHE)
+        print("  Re-authorizing (token expired or missing required scopes)...")
+
     with open(creds_path) as f:
         creds_data = json.load(f)
 
     if creds_data.get("type") == "service_account":
         return ServiceCredentials.from_service_account_file(creds_path, scopes=SCOPES)
 
-    # OAuth — try cached token, but only if it has all required scopes
-    if os.path.exists(TOKEN_CACHE):
-        with open(TOKEN_CACHE, "rb") as f:
-            creds = pickle.load(f)
-        token_scopes = set(creds.scopes or [])
-        required_scopes = set(SCOPES)
-        if creds and creds.valid and required_scopes.issubset(token_scopes):
-            return creds
-        if creds and creds.expired and creds.refresh_token and required_scopes.issubset(token_scopes):
-            creds.refresh(Request())
-            with open(TOKEN_CACHE, "wb") as f:
-                pickle.dump(creds, f)
-            return creds
-        # Scopes changed or token invalid — delete cache and re-auth
-        os.remove(TOKEN_CACHE)
-        print("  Re-authorizing (new permissions required for Docs + Drive)...")
-
+    # OAuth flow — opens browser once; token cached for future runs
     flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
     creds = flow.run_local_server(port=0)
     with open(TOKEN_CACHE, "wb") as f:
@@ -143,110 +146,107 @@ def _ensure_grid(ws, rows_needed: int, cols_needed: int) -> None:
 
 # ── Google Doc memo creation ──────────────────────────────────────────────────
 
+def _fmt_k(n: float) -> str:
+    """Format a dollar amount compactly: $315K, $1,003K, or $2.1M."""
+    if n >= 10_000_000:
+        return f"${n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"${round(n / 1_000):,}K"
+    return f"${n:,.0f}"
+
+
+def _as_list(value) -> list[str]:
+    """Return value as a list of strings regardless of whether it's a list or string."""
+    if isinstance(value, list):
+        return [str(s).strip().rstrip(".") for s in value if str(s).strip()]
+    if isinstance(value, str) and value.strip():
+        import re as _re
+        # Split on "Step N:" markers or numbered list markers
+        parts = _re.split(r"(?:Step\s+\d+:\s*|\s*\d+\.\s+)", value, flags=_re.IGNORECASE)
+        return [p.strip().rstrip(".") for p in parts if p.strip()]
+    return []
+
+
 def _build_memo_segments(insights: dict) -> list[tuple[str, bool]]:
     """
     Returns the memo as a list of (text, is_bold) segments.
 
-    Designed for a one-page US Letter document aimed at a CEO/CFO audience:
-    scannable bullets, no filler prose, key numbers front-and-centre.
-    Each segment ends with a newline so they concatenate into the full body.
+    Format: compact standard-memo header, then SITUATION / TOP 3 / 30-DAY ACTIONS.
+    No ellipsis truncation — the synthesis prompt constrains all fields at source.
+    Targets ~38 lines on one US Letter page at 11pt Calibri with 1-inch margins.
     """
-    memo = insights.get("executive_memo", {})
-    opps = insights.get("opportunities", [])
-    total_spend = insights.get("total_spend_usd", 0)
-    total_low   = sum(o.get("savings_low_usd",  0) for o in opps[:3])
-    total_high  = sum(o.get("savings_high_usd", 0) for o in opps[:3])
+    memo  = insights.get("executive_memo", {})
+    opps  = insights.get("opportunities", [])
+    total_spend   = insights.get("total_spend_usd", 0)
+    total_low     = sum(o.get("savings_low_usd",  0) for o in opps[:3])
+    total_high    = sum(o.get("savings_high_usd", 0) for o in opps[:3])
     analysis_date = insights.get("analysis_date", date.today().isoformat())
-
-    # Compute total addressable savings (conservative benchmarks)
-    dept_summary = insights.get("department_summary", [])
-    # Rough addressable from full Optimize+Consolidate portfolio
-    addr_low  = total_spend * 0.19   # ~15% of Optimize + ~30% of Consolidate blended
-    addr_high = total_spend * 0.31
+    rec           = insights.get("recommendation_summary", {})
 
     SEP = "─" * 62 + "\n"
-    B, N = True, False   # bold flag shorthand
+    B, N = True, False
 
-    segs: list[tuple[str, bool]] = [
-        ("MEMORANDUM\n", B),
-        (SEP, N),
-        (f"TO:    Chief Executive Officer  ·  Chief Financial Officer\n", N),
-        (f"FROM:  {memo.get('from', 'VP of Operations')}\n", N),
-        (f"DATE:  {analysis_date}\n", N),
-        (f"RE:    Vendor Spend Reduction — ${total_low:,.0f}–${total_high:,.0f} Annual Savings Identified\n", B),
-        (SEP, N),
-        ("\n", N),
-        ("SITUATION\n", B),
-        (f"  •  {insights.get('total_vendors', 386)} active vendors  |  ${total_spend:,.0f} TTM spend\n", N),
-    ]
-
-    # Most significant spend concentration fact
-    top_vendor = next(
-        (d for d in sorted(dept_summary, key=lambda x: x.get("total_spend", 0), reverse=True)
-         if d.get("department")), None
-    )
     salesforce_pct = round(3_117_226 / total_spend * 100) if total_spend else 40
-    segs += [
-        (f"  •  Salesforce = {salesforce_pct}% of total spend (${3_117_226:,}) — "
-         f"no evidence of volume pricing leverage\n", N),
-        (f"  •  Recommendation mix: "
-         f"{insights.get('recommendation_summary', {}).get('Terminate', 211)} terminate  ·  "
-         f"{insights.get('recommendation_summary', {}).get('Consolidate', 54)} consolidate  ·  "
-         f"{insights.get('recommendation_summary', {}).get('Optimize', 121)} optimize\n", N),
-        ("\n", N),
-        ("TOP 3 OPPORTUNITIES\n", B),
+
+    # ── Header (no MEMORANDUM banner — wastes a line) ──────────────
+    segs: list[tuple[str, bool]] = [
+        (f"TO:    CEO  ·  CFO"
+         f"{'':>38}{analysis_date}\n", N),
+        (f"FROM:  {memo.get('from', 'VP of Operations')}\n", N),
+        (f"RE:    Vendor Spend Reduction — "
+         f"{_fmt_k(total_low)}–{_fmt_k(total_high)} Annual Savings\n", B),
         (SEP, N),
+        ("\n", N),
     ]
 
-    savings_labels = {1: "Est. Savings / Year", 2: "", 3: ""}
+    # ── Situation ──────────────────────────────────────────────────
+    segs += [
+        ("SITUATION\n", B),
+        (f"  {insights.get('total_vendors', 386)} vendors  |  "
+         f"${total_spend:,.0f} TTM spend  |  "
+         f"{rec.get('Terminate', 0)} terminate  ·  "
+         f"{rec.get('Consolidate', 0)} consolidate  ·  "
+         f"{rec.get('Optimize', 0)} optimize\n", N),
+        (f"  Salesforce = {salesforce_pct}% of spend (${3_117_226:,}) "
+         f"— no volume discount in place\n", N),
+        ("\n", N),
+    ]
+
+    # ── Top 3 Opportunities ────────────────────────────────────────
+    segs.append(("TOP 3 OPPORTUNITIES\n", B))
+
     for opp in opps[:3]:
-        low  = opp.get("savings_low_usd",  0)
-        high = opp.get("savings_high_usd", 0)
-        vendors = ", ".join(opp.get("affected_vendors", []))
+        low    = opp.get("savings_low_usd",  0)
+        high   = opp.get("savings_high_usd", 0)
+        title  = opp.get("title", "")
+        vendors_list = opp.get("affected_vendors", [])
+        vendors_str  = ", ".join(vendors_list) if vendors_list else ""
+
         segs += [
-            (f"\n{opp.get('rank', '')}. {opp.get('title', '')}", B),
-            (f"   ${low:,.0f}–${high:,.0f}/yr\n", N),
+            ("\n", N),
+            (f"{opp.get('rank', '')}. {title}", B),
+            (f"   {_fmt_k(low)}–{_fmt_k(high)}/yr\n", N),
         ]
-        if vendors:
-            segs.append((f"   Vendors: {vendors}\n", N))
-        # Use implementation_steps as concise action bullets (max 3).
-        # Fall back to first sentence of description if steps unavailable.
-        import re as _re
-        steps_raw = opp.get("implementation_steps", "").strip()
-        if steps_raw:
-            steps = [s.strip() for s in _re.split(r"\.\s+|;\s*", steps_raw) if s.strip()]
-            for step in steps[:3]:
-                segs.append((f"   •  {step.rstrip('.')}\n", N))
-        else:
-            first = opp.get("description", "").split(". ")[0].strip()
-            if first:
-                segs.append((f"   •  {first.rstrip('.')}\n", N))
+        if vendors_str:
+            segs.append((f"   {vendors_str}\n", N))
+
+        for bullet in _as_list(opp.get("implementation_steps", ""))[:2]:
+            segs.append((f"   •  {bullet}\n", N))
+
         if opp.get("risks"):
-            # One sentence only — enough for a busy reader
-            risk_brief = opp["risks"].split(".")[0].strip()
-            segs.append((f"   ⚠  {risk_brief}\n", N))
+            segs.append((f"   ⚠  {opp['risks']}\n", N))
 
     segs += [
-        (SEP, N),
-        (f"Combined savings (Top 3):          ${total_low:,.0f} – ${total_high:,.0f}/year\n", B),
-        (f"Full addressable opportunity:      ${addr_low:,.0f} – ${addr_high:,.0f}/year\n", N),
         ("\n", N),
-        ("30-DAY SPRINT\n", B),
         (SEP, N),
+        (f"Combined savings (Top 3):   {_fmt_k(total_low)} – {_fmt_k(total_high)}/year\n", B),
+        ("\n", N),
     ]
 
-    # Immediate actions — Claude returns these as a numbered inline string or
-    # newline-separated list; split on either pattern and strip the numbers.
-    import re as _re
-    actions_raw = memo.get("immediate_actions", "")
-    # Split on "1." / "2." style markers that appear mid-string or at line start
-    items = _re.split(r"\s*\d+\.\s+", actions_raw)
-    for item in items:
-        item = item.strip().rstrip(".")
-        if item:
-            # Truncate each action to first sentence for brevity
-            first_sentence = item.split(". ")[0].strip()
-            segs.append((f"  •  {first_sentence}\n", N))
+    # ── 30-Day Actions ─────────────────────────────────────────────
+    segs.append(("30-DAY ACTIONS\n", B))
+    for action in _as_list(memo.get("immediate_actions", ""))[:4]:
+        segs.append((f"  •  {action}\n", N))
 
     return segs
 
@@ -420,8 +420,10 @@ def _write_opportunities_tab(ws, insights: dict) -> None:
 
         add(rank_col,    opp.get("rank", i + 1))
         add(title_col,   opp.get("title", ""))
+        steps = opp.get("implementation_steps", "")
+        steps_str = "\n".join(_as_list(steps)) if isinstance(steps, list) else steps
         add(desc_col,    opp.get("description", "")
-                         + ("\n\nActions: " + opp["implementation_steps"] if opp.get("implementation_steps") else ""))
+                         + ("\n\nActions:\n" + steps_str if steps_str else ""))
         add(vendor_col,  ", ".join(opp.get("affected_vendors", [])))
         add(spend_col,   opp.get("current_spend_usd", ""))
         add(low_col,     opp.get("savings_low_usd", ""))
@@ -634,11 +636,10 @@ def _write_methodology_tab(ws, insights: dict, qa_report: dict | None) -> None:
 
 
 def _write_memo_tab(ws, doc_url: str) -> None:
-    """Writes only the Google Doc link into the Recommendations tab — nothing else."""
+    """Writes the Google Doc link into A2, preserving the existing header in A1."""
     _ensure_grid(ws, 2, 1)
-    ws.update("A1", [[doc_url]], value_input_option="RAW")
-    # Wrap so the URL is fully visible without needing to widen the column
-    ws.format("A1", {"wrapStrategy": "WRAP"})
+    ws.update("A2", [[doc_url]], value_input_option="RAW")
+    ws.format("A2", {"wrapStrategy": "WRAP"})
     print(f"  Recommendations tab: memo link written → {doc_url}")
 
 

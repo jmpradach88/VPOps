@@ -15,20 +15,24 @@ import anthropic
 from config import MODEL, MAX_TOKENS, MAX_RETRIES, RETRY_DELAY, INSIGHTS_JSON
 
 INSIGHTS_SYSTEM_PROMPT = """\
-You are a VP of Operations writing for a CEO and CFO audience. You have just completed \
-a vendor spend analysis and must produce two deliverables from the data provided:
+You are a VP of Operations writing for a CEO and CFO audience. Produce two deliverables \
+from the vendor spend data provided:
 
 1. TOP 3 OPPORTUNITIES — the three highest-impact cost-reduction opportunities, \
-   grounded in the actual vendor data. Each opportunity must be specific (name the \
-   vendors involved), financially justified (estimate annual savings in USD), and \
-   actionable (describe the recommended action in 2-3 sentences).
+   grounded in the actual data. Name the specific vendors, justify savings in USD, \
+   and state what to do.
 
-2. EXECUTIVE MEMO — a concise, professionally formatted memo summarizing findings \
-   and recommending actions. Audience: CEO and CFO. Tone: direct, data-driven, \
-   zero filler. Must include a realistic implementation timeline and key risks.
+2. EXECUTIVE MEMO fields — raw data for a one-page memo. Every field has a strict \
+   length constraint; stay within it or the memo will not fit on one page.
 
-IMPORTANT: Every dollar figure, vendor name, and percentage in your output must be \
-derived from the data provided. Do not invent numbers or reference vendors not in the data.
+LENGTH RULES (hard limits — do not exceed):
+  - opportunity title:          ≤ 7 words, action-oriented (e.g. "Audit Salesforce Licences and Renegotiate")
+  - implementation_steps:       exactly 2 strings, each ≤ 12 words
+  - risks:                      1 clause, ≤ 15 words, no full stop
+  - immediate_actions:          exactly 4 strings, each ≤ 12 words
+
+IMPORTANT: Every dollar figure, vendor name, and percentage must come from the data. \
+Do not invent numbers or reference vendors not in the data.
 
 Return a single JSON object with this exact schema:
 {
@@ -45,27 +49,25 @@ Return a single JSON object with this exact schema:
     {
       "rank": 1,
       "title": "...",
-      "description": "...",
+      "description": "one or two sentence description for the XLSX detail tab",
       "affected_vendors": ["vendor1", "vendor2"],
       "current_spend_usd": <float>,
       "savings_low_usd": <float>,
       "savings_high_usd": <float>,
       "savings_rationale": "...",
-      "implementation_steps": "...",
+      "implementation_steps": ["step one ≤12 words", "step two ≤12 words"],
       "timeline": "...",
-      "risks": "..."
+      "risks": "single short clause ≤15 words"
     }
   ],
   "executive_memo": {
-    "to": "Chief Executive Officer, Chief Financial Officer",
     "from": "VP of Operations",
-    "date": "YYYY-MM-DD",
-    "subject": "...",
-    "executive_summary": "...",
-    "opportunity_details": "...",
-    "department_highlights": "...",
-    "immediate_actions": "...",
-    "total_savings_statement": "..."
+    "immediate_actions": [
+      "action one ≤12 words",
+      "action two ≤12 words",
+      "action three ≤12 words",
+      "action four ≤12 words"
+    ]
   }
 }
 No markdown fences. No preamble."""
@@ -118,6 +120,29 @@ def _build_synthesis_prompt(
             f"  {c['vendor_name']} | ${cost:,.0f} | {c.get('recommendation_note','')}"
         )
 
+    # Optimize vendors grouped by department — surfaces multi-vendor consolidation
+    # opportunities that the classifier may have rated individually as Optimize
+    # rather than Consolidate (e.g. two competing audit firms both flagged Optimize).
+    optimize_by_dept: dict[str, list[dict]] = {}
+    for c in classifications:
+        if c.get("recommendation") == "Optimize":
+            dept = c.get("department", "Unknown")
+            optimize_by_dept.setdefault(dept, []).append(c)
+
+    optimize_group_lines = []
+    for dept, vlist in sorted(optimize_by_dept.items(),
+                               key=lambda x: sum(cost_map.get(v["vendor_name"], 0) for v in x[1]),
+                               reverse=True):
+        if len(vlist) < 2:
+            continue  # only show departments with multiple Optimize vendors
+        dept_spend = sum(cost_map.get(v["vendor_name"], 0) for v in vlist)
+        optimize_group_lines.append(f"  {dept} ({len(vlist)} vendors, ${dept_spend:,.0f} combined):")
+        for v in sorted(vlist, key=lambda x: cost_map.get(x["vendor_name"], 0), reverse=True)[:8]:
+            cost = cost_map.get(v["vendor_name"], 0)
+            optimize_group_lines.append(
+                f"    {v['vendor_name']} | ${cost:,.0f} | {v.get('description', '')}"
+            )
+
     # Department spend summary
     dept_lines = sorted(dept_totals.items(), key=lambda x: x[1]["spend"], reverse=True)
     dept_summary = "\n".join(
@@ -147,8 +172,16 @@ TOP 30 VENDORS BY SPEND
 ALL CONSOLIDATE-FLAGGED VENDORS ({len(consolidate_vendors)} total)
 {chr(10).join(consolidate_lines) if consolidate_lines else '  (none flagged)'}
 
+OPTIMIZE VENDORS GROUPED BY DEPARTMENT
+(Multiple Optimize vendors in the same department often signal a consolidation \
+opportunity even if not individually flagged as Consolidate. Review for overlap.)
+{chr(10).join(optimize_group_lines) if optimize_group_lines else '  (none)'}
+
 Use this data to identify the three highest-impact opportunities. \
-Prioritize by dollar impact. Be specific about which vendors to act on and why."""
+Prioritize by dollar impact. Consolidation opportunities across multiple Optimize \
+vendors in the same department are valid — treat them as Consolidate opportunities \
+if the vendors clearly provide overlapping services. Be specific about which vendors \
+to act on and why."""
 
     return prompt
 

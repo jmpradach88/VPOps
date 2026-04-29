@@ -147,7 +147,22 @@ def main() -> None:
     print("[4/6] Running AI-based QA review...")
     qa_report = None
     if args.skip_qa:
-        print("  QA pass skipped (--skip-qa)\n")
+        # Reconstruct qa_report from cache if available so methodology stats are populated
+        if os.path.exists(QA_JSON):
+            with open(QA_JSON, encoding="utf-8") as f:
+                qa_results = json.load(f)
+            qa_report = {
+                "ok":           sum(1 for v in qa_results if v.get("severity") == "ok"),
+                "warn":         sum(1 for v in qa_results if v.get("severity") == "warn"),
+                "error":        sum(1 for v in qa_results if v.get("severity") == "error"),
+                "reclassified": sum(1 for v in qa_results if v.get("qa_reclassified", False)),
+                "qa_results":   qa_results,
+            }
+            print(f"  QA pass skipped — loaded cached results "
+                  f"({qa_report['ok']} ok, {qa_report['warn']} warn, "
+                  f"{qa_report['error']} error)\n")
+        else:
+            print("  QA pass skipped (--skip-qa)\n")
         for c in classifications:
             c.setdefault("qa_reclassified", False)
             c.setdefault("qa_warn", False)
@@ -179,10 +194,6 @@ def main() -> None:
     # ── 6. Validate ───────────────────────────────────────────────
     print("[6/6] Running validation checks...")
     report = validate(vendors, classifications)
-    print_report(report)
-
-    if not report["passed"]:
-        print("WARNING: Validation flagged issues — review report above before submitting.\n")
 
     # ── Build XLSX ────────────────────────────────────────────────
     print(f"Building {OUTPUT_XLSX}...")
@@ -197,6 +208,11 @@ def main() -> None:
             from write_back import write_back
             print("Writing results back to Google Sheets...")
             write_back(sheets_id, vendors, classifications, insights, qa_report)
+
+    # ── Validation Report ─────────────────────────────────────────
+    print_report(report)
+    if not report["passed"]:
+        print("WARNING: Validation flagged issues — review report above before submitting.\n")
 
     # ── Summary ───────────────────────────────────────────────────
     rec_dist = report["recommendation_distribution"]

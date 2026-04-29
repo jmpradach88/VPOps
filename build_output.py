@@ -300,6 +300,20 @@ def _build_methodology_tab(wb: openpyxl.Workbook, insights: dict, qa_report: dic
             ws.row_dimensions[r].height = 80
 
 
+def _actions_str(value) -> str:
+    """Normalise immediate_actions to a plain multi-line string for Excel."""
+    if isinstance(value, list):
+        return "\n".join(f"• {s}" for s in value if str(s).strip())
+    return str(value) if value else ""
+
+
+def _steps_str(value) -> str:
+    """Normalise implementation_steps (list or string) to a plain string."""
+    if isinstance(value, list):
+        return "\n".join(f"• {s}" for s in value if str(s).strip())
+    return str(value) if value else ""
+
+
 # ── Tab 4: Executive Memo ──────────────────────────────────────────────────────
 def _build_executive_memo_tab(wb: openpyxl.Workbook, insights: dict) -> None:
     ws = wb.create_sheet("Recommendations")
@@ -334,26 +348,24 @@ def _build_executive_memo_tab(wb: openpyxl.Workbook, insights: dict) -> None:
         lines.append(("", "spacer"))
         lines.append((f"{opp.get('rank','')}.  {opp.get('title','')} — Estimated Savings: {savings_str}/year", "bold"))
         body = opp.get("description", "")
-        if opp.get("implementation_steps"):
-            body += f"\n\n{opp['implementation_steps']}"
+        steps = _steps_str(opp.get("implementation_steps", ""))
+        if steps:
+            body += f"\n\nActions:\n{steps}"
         if opp.get("risks"):
-            body += f"\n\nRisks: {opp['risks']}"
+            body += f"\n\nRisk: {opp['risks']}"
         lines.append((body, "body"))
 
     lines += [
         ("", "spacer"),
         ("─" * 100, "divider"),
         ("", "spacer"),
-        ("DEPARTMENT HIGHLIGHTS", "section"),
-        (memo.get("department_highlights", ""), "body"),
         ("", "spacer"),
         ("RECOMMENDED IMMEDIATE ACTIONS (30-Day Sprint)", "section"),
-        (memo.get("immediate_actions", ""), "body"),
+        (_actions_str(memo.get("immediate_actions", "")), "body"),
         ("", "spacer"),
         ("─" * 100, "divider"),
         ("", "spacer"),
         (f"TOTAL ESTIMATED ANNUAL SAVINGS:  ${total_low:,.0f} – ${total_high:,.0f}", "bold"),
-        (memo.get("total_savings_statement", ""), "body"),
     ]
 
     for text, style in lines:
