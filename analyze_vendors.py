@@ -28,6 +28,7 @@ import os
 import sys
 
 from config import CLASSIFIED_JSON, RESEARCHED_JSON, QA_JSON, INSIGHTS_JSON, OUTPUT_XLSX
+from fetch_data import _extract_sheets_id
 from fetch_data import get_vendors
 from research_vendors import research_all_vendors
 from classify_vendors import classify_all_vendors
@@ -75,6 +76,11 @@ def main() -> None:
     parser.add_argument("--skip-classify",  action="store_true")
     parser.add_argument("--skip-qa",        action="store_true")
     parser.add_argument("--skip-synthesis", action="store_true")
+    parser.add_argument(
+        "--write-back",
+        action="store_true",
+        help="Write results back to the source Google Sheet (requires GOOGLE_CREDENTIALS_FILE)",
+    )
     args = parser.parse_args()
 
     # If no --input but vendors_raw.csv exists, allow re-running from cache
@@ -181,6 +187,16 @@ def main() -> None:
     # ── Build XLSX ────────────────────────────────────────────────
     print(f"Building {OUTPUT_XLSX}...")
     build_xlsx(vendors, classifications, insights, qa_report)
+
+    # ── Write-back ───────────────────────────────────────────────
+    if args.write_back:
+        sheets_id = _extract_sheets_id(args.input or "")
+        if not sheets_id:
+            print("WARNING: --write-back requires a Google Sheets URL or ID as --input. Skipping.")
+        else:
+            from write_back import write_back
+            print("Writing results back to Google Sheets...")
+            write_back(sheets_id, vendors, classifications)
 
     # ── Summary ───────────────────────────────────────────────────
     rec_dist = report["recommendation_distribution"]

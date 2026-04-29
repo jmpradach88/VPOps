@@ -1,5 +1,6 @@
 # Secrets
 .env
+token.pickle            # OAuth token cache — do not commit
 
 # Generated intermediate files (may contain vendor spend data)
 vendors_raw.csv
