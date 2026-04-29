@@ -7,7 +7,9 @@ Built with the **Claude Code CLI** using the Anthropic SDK (`claude-sonnet-4-6`)
 All classification, QA review, and synthesis is performed programmatically via the API —
 no manual data entry.
 
-**Source data:** [Google Sheet AP ledger](https://docs.google.com/spreadsheets/d/1L2u8j-3cSFLPMXbbBljI4YYXQ9COYS5YihtBhxWTPls)
+**Input:** [`vendors_raw.csv`](vendors_raw.csv) — AP ledger (386 vendors, $7.9M TTM spend)  
+**Source sheet:** [Google Sheets](https://docs.google.com/spreadsheets/d/1L2u8j-3cSFLPMXbbBljI4YYXQ9COYS5YihtBhxWTPls)  
+**Output:** [`VendorAnalysis_Output.xlsx`](VendorAnalysis_Output.xlsx) — classified vendor data, Top 3 opportunities, methodology, memo link
 
 ## Setup
 
