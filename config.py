@@ -12,6 +12,11 @@ BATCH_SIZE = 50        # vendors per Claude API call; 50 is the reliability swee
 MAX_RETRIES = 3
 RETRY_DELAY = 5        # seconds; doubled on each rate-limit retry
 
+# Temperature = 0 for synthesis and re-classification to ensure deterministic
+# structured JSON output. Classification and QA use the model default (non-zero)
+# so responses remain varied and don't converge on a single pattern.
+SYNTHESIS_TEMPERATURE = 0
+
 # Vendors above this annual spend get a web research pass in addition to
 # Claude's training-knowledge pass. Below this, name inference is sufficient.
 RESEARCH_THRESHOLD = 20_000

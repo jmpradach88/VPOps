@@ -14,6 +14,110 @@ MAX_DESCRIPTION_WORDS = 20
 HIGH_SPEND_TERMINATE_THRESHOLD = 10_000  # flag Terminate on vendors above this
 
 
+def check_cross_batch_consistency(
+    classifications: list[dict],
+    cost_map: dict,
+) -> list[dict]:
+    """
+    Pure-Python consistency check — no API calls.
+
+    Detects three classes of systematic anomalies that suggest batch-level
+    classification drift rather than vendor-level facts:
+
+    1. Department Terminate storm: >50% of vendors in a department are Terminate
+       while others are Optimize — suggests the classifier flipped a whole batch.
+    2. High-spend Terminate: any vendor ≥$50K flagged Terminate — almost always
+       needs CFO-grade justification that the AI unlikely has.
+    3. Keyword contradiction: two or more vendors in the same department share a
+       service keyword (audit, cloud, …) but have opposite Terminate/Optimize
+       recommendations — the logic that applies to one should apply to the other.
+
+    Returns a deduplicated list of anomaly dicts:
+    {vendor_name, department, recommendation, cost_usd, issue}
+    """
+    anomalies: list[dict] = []
+
+    # Group vendors by department
+    by_dept: dict[str, list[dict]] = {}
+    for c in classifications:
+        dept = c.get("department", "Unknown")
+        by_dept.setdefault(dept, []).append(c)
+
+    for dept, vendors in by_dept.items():
+        recs = [v.get("recommendation") for v in vendors]
+        terminate_count = recs.count("Terminate")
+        optimize_count  = recs.count("Optimize")
+        total           = len(vendors)
+
+        # ── 1. Terminate storm ────────────────────────────────────────────────
+        if total >= 4 and optimize_count > 0 and (terminate_count / total) > 0.5:
+            for v in vendors:
+                if v.get("recommendation") == "Terminate":
+                    anomalies.append({
+                        "vendor_name":     v["vendor_name"],
+                        "department":      dept,
+                        "recommendation":  "Terminate",
+                        "cost_usd":        cost_map.get(v["vendor_name"], 0),
+                        "issue": (
+                            f"Dept {dept}: {terminate_count}/{total} vendors are Terminate "
+                            f"— possible batch-level drift"
+                        ),
+                    })
+
+        # ── 2. High-spend Terminate ───────────────────────────────────────────
+        HIGH_SPEND_THRESHOLD = 50_000
+        for v in vendors:
+            if v.get("recommendation") == "Terminate":
+                cost = cost_map.get(v["vendor_name"], 0)
+                if cost >= HIGH_SPEND_THRESHOLD:
+                    anomalies.append({
+                        "vendor_name":     v["vendor_name"],
+                        "department":      dept,
+                        "recommendation":  "Terminate",
+                        "cost_usd":        cost,
+                        "issue": (
+                            f"Terminate on ${cost:,.0f} spend — "
+                            f"requires CFO-grade justification"
+                        ),
+                    })
+
+        # ── 3. Keyword contradiction ──────────────────────────────────────────
+        SERVICE_KEYWORDS = [
+            "audit", "cloud", "recruit", "legal", "software",
+            "consulting", "platform", "saas",
+        ]
+        for kw in SERVICE_KEYWORDS:
+            matching = [
+                v for v in vendors
+                if kw in v.get("description", "").lower()
+            ]
+            if len(matching) >= 2:
+                recs_in_group = {v.get("recommendation") for v in matching}
+                if "Terminate" in recs_in_group and "Optimize" in recs_in_group:
+                    for v in matching:
+                        anomalies.append({
+                            "vendor_name":     v["vendor_name"],
+                            "department":      dept,
+                            "recommendation":  v.get("recommendation"),
+                            "cost_usd":        cost_map.get(v["vendor_name"], 0),
+                            "issue": (
+                                f"Keyword '{kw}' shared across {len(matching)} vendors "
+                                f"in {dept} with contradictory recommendations"
+                            ),
+                        })
+
+    # Deduplicate (same vendor + same issue text)
+    seen:   set   = set()
+    unique: list  = []
+    for a in anomalies:
+        key = (a["vendor_name"], a["issue"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(a)
+
+    return unique
+
+
 def validate(vendors: list[dict], classifications: list[dict]) -> dict:
     """
     Runs deterministic quality checks. Returns a report dict.
@@ -85,6 +189,8 @@ def validate(vendors: list[dict], classifications: list[dict]) -> dict:
 
     missing_depts = [d for d in DEPARTMENTS if d not in dept_dist]
 
+    cross_batch_anomalies = check_cross_batch_consistency(classifications, cost_map)
+
     passed = (
         coverage >= 0.98
         and not invalid_depts
@@ -105,6 +211,7 @@ def validate(vendors: list[dict], classifications: list[dict]) -> dict:
         "department_distribution":    dict(sorted(dept_dist.items())),
         "recommendation_distribution": rec_dist,
         "missing_departments":        missing_depts,
+        "cross_batch_anomalies":      cross_batch_anomalies,
     }
 
 
@@ -155,6 +262,19 @@ def print_report(report: dict) -> None:
         print(f"[MISSING CLASSIFICATIONS: {len(report['missing_vendors'])} vendor(s)]")
         for name in report["missing_vendors"][:5]:
             print(f"  {name}")
+        print()
+
+    anomalies = report.get("cross_batch_anomalies", [])
+    if anomalies:
+        print(f"[CROSS-BATCH ANOMALIES: {len(anomalies)} flag(s)]")
+        for a in sorted(anomalies, key=lambda x: -x["cost_usd"])[:10]:
+            print(f"  ${a['cost_usd']:>10,.0f}  {a['vendor_name']}  ({a['recommendation']})")
+            print(f"              ↳ {a['issue']}")
+        if len(anomalies) > 10:
+            print(f"  … and {len(anomalies) - 10} more")
+        print()
+    else:
+        print("[CROSS-BATCH ANOMALIES: none detected]")
         print()
 
     print("=" * W)

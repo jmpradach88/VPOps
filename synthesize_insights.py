@@ -12,7 +12,7 @@ from datetime import date
 
 import anthropic
 
-from config import MODEL, MAX_TOKENS, MAX_RETRIES, RETRY_DELAY, INSIGHTS_JSON
+from config import MODEL, MAX_TOKENS, MAX_RETRIES, RETRY_DELAY, INSIGHTS_JSON, SYNTHESIS_TEMPERATURE
 
 INSIGHTS_SYSTEM_PROMPT = """\
 You are a VP of Operations writing for a CEO and CFO audience. Produce two deliverables \
@@ -291,6 +291,7 @@ def synthesize(
             response = client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
+                temperature=SYNTHESIS_TEMPERATURE,  # deterministic JSON output
                 system=[
                     {
                         "type": "text",

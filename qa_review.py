@@ -171,6 +171,7 @@ def _reclassify_errors(
             response = client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
+                temperature=0,  # deterministic re-classification after QA feedback
                 system=[{"type": "text", "text": CLASSIFICATION_SYSTEM_PROMPT,
                           "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": user_content}],
