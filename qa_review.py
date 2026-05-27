@@ -28,26 +28,39 @@ QA_SYSTEM_PROMPT = """\
 You are a senior procurement auditor reviewing vendor classifications produced by \
 an AI assistant. Your job is to flag errors — not rewrite everything.
 
-For each vendor classification, evaluate:
+For each vendor classification, evaluate all five criteria:
+
 1. DEPARTMENT FIT: Is the assigned department correct given the vendor name, \
    description, and spend level? Flag if it should clearly be a different department.
+
 2. DESCRIPTION QUALITY: Is the description specific and factual? \
    Flag if it is vague (e.g., "provides business services"), generic, or \
    potentially hallucinated (states facts that are likely wrong).
+
 3. RECOMMENDATION CONSISTENCY:
-   - "Terminate" on a vendor with spend >$10,000 requires a clear reason \
-     (duplicate, defunct, one-off). Flag if the note is weak or missing.
-   - "Consolidate" must name the specific duplicate in the note. \
-     Flag if it just says "consolidate" with no target.
-   - "Optimize" applied to a one-time purchase or a tiny vendor (<$200) \
+   - "Terminate" on a vendor with spend >$10,000 requires explicit evidence of \
+     zero recurring value (confirmed duplicate entry, defunct company, or one-off \
+     purchase with no repeat pattern). Flag if the justification is weak or absent.
+   - "Consolidate" must name the specific vendor to consolidate INTO — not just \
+     "another vendor on the list" or a vague reference. Flag if no named target.
+   - "Optimize" applied to a one-time purchase or a vendor with spend <$200 \
      is suspicious — flag it.
+
 4. FACTUAL ACCURACY: Flag any description that contradicts widely-known facts \
    (e.g., AWS described as "HR software", Salesforce described as "cloud hosting").
 
+5. SPEND PROPORTIONALITY: For vendors with spend ≥$50,000, apply heightened scrutiny:
+   - "Terminate" requires particularly strong justification at this spend level; \
+     flag if the reason would not withstand a CFO review.
+   - "Optimize" notes should reference a specific lever (volume discount, licence \
+     right-sizing, contract renegotiation); flag if the note is generic.
+   - "Consolidate" notes must name a concrete target vendor and explain the overlap.
+
 Severity definitions:
   "ok"   — no issues; classification looks correct
-  "warn" — minor concern that should be noted but does not require re-classification
-  "error"— clear misclassification or fabricated description; must be re-classified
+  "warn" — minor concern worth noting; does not require re-classification
+  "error"— clear misclassification or fabricated/unsupported description; \
+            must be re-classified
 
 Return ONLY a JSON array, one object per vendor, same order as input.
 Schema:

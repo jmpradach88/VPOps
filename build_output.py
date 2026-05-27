@@ -120,14 +120,23 @@ def _build_opportunities_tab(wb: openpyxl.Workbook, insights: dict) -> None:
         current      = opp.get("current_spend_usd", 0)
         vendors_list = ", ".join(opp.get("affected_vendors", [])[:4])
 
-        desc_body = opp.get("description", "")
-        steps     = opp.get("implementation_steps", "")
-        risks     = opp.get("risks", "")
-        full_desc = desc_body
+        desc_body   = opp.get("description", "")
+        steps       = opp.get("implementation_steps", "")
+        risks       = opp.get("risks", "")
+        confidence  = opp.get("savings_confidence", "")
+        conf_note   = opp.get("savings_confidence_rationale", "")
+        full_desc   = desc_body
         if steps:
-            full_desc += f"\n\nActions: {steps}"
+            steps_str = "\n".join(f"• {s}" for s in steps) if isinstance(steps, list) else steps
+            full_desc += f"\n\nActions:\n{steps_str}"
         if risks:
-            full_desc += f"\n\nRisks: {risks}"
+            full_desc += f"\n\nRisk: {risks}"
+        if confidence:
+            conf_label = {"high": "HIGH ✓", "medium": "MEDIUM ~", "low": "LOW ⚠"}.get(
+                confidence.lower(), confidence.upper())
+            full_desc += f"\n\nSavings confidence: {conf_label}"
+            if conf_note:
+                full_desc += f" — {conf_note}"
         if vendors_list:
             full_desc += f"\n\nVendors: {vendors_list}"
 

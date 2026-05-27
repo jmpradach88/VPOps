@@ -16,22 +16,30 @@ from config import MODEL, MAX_TOKENS, MAX_RETRIES, RETRY_DELAY, INSIGHTS_JSON
 
 INSIGHTS_SYSTEM_PROMPT = """\
 You are a VP of Operations writing for a CEO and CFO audience. Produce two deliverables \
-from the vendor spend data provided:
+from the vendor spend data provided.
 
-1. TOP 3 OPPORTUNITIES — the three highest-impact cost-reduction opportunities, \
-   grounded in the actual data. Name the specific vendors, justify savings in USD, \
-   and state what to do.
+━━━ SELECTION RULE ━━━
+Your Top 3 opportunities MUST be selected from the RANKED_CANDIDATES list in the user \
+prompt. Do not select vendors or groups outside that list. You may write better titles \
+and descriptions — but candidate selection is determined by the ranked list, not by you.
 
-2. EXECUTIVE MEMO fields — raw data for a one-page memo. Every field has a strict \
-   length constraint; stay within it or the memo will not fit on one page.
+━━━ SAVINGS CONFIDENCE ━━━
+Every opportunity must include a savings_confidence rating:
+  "high"   — savings calculable directly from spend (e.g. eliminate a known duplicate \
+              subscription; the full duplicated spend is the saving)
+  "medium" — savings require renegotiation or consolidation using market-rate benchmarks \
+              (common for SaaS contracts, audit firm consolidations)
+  "low"    — savings depend on usage, seat-count, or contract data not present in \
+              this dataset
 
-LENGTH RULES (hard limits — do not exceed):
-  - opportunity title:          ≤ 7 words, action-oriented (e.g. "Audit Salesforce Licences and Renegotiate")
-  - implementation_steps:       exactly 2 strings, each ≤ 12 words
-  - risks:                      1 clause, ≤ 15 words, no full stop
-  - immediate_actions:          exactly 4 strings, each ≤ 12 words
+━━━ LENGTH RULES (hard limits — memo will not fit one page if exceeded) ━━━
+  - title:                ≤ 7 words, action-oriented verb first
+  - implementation_steps: exactly 2 strings, each ≤ 12 words
+  - risks:                1 clause ≤ 15 words, no full stop
+  - immediate_actions:    exactly 4 strings, each ≤ 12 words
 
-IMPORTANT: Every dollar figure, vendor name, and percentage must come from the data. \
+━━━ DATA INTEGRITY ━━━
+Every dollar figure, vendor name, and percentage must be derived from the data provided. \
 Do not invent numbers or reference vendors not in the data.
 
 Return a single JSON object with this exact schema:
@@ -49,12 +57,14 @@ Return a single JSON object with this exact schema:
     {
       "rank": 1,
       "title": "...",
-      "description": "one or two sentence description for the XLSX detail tab",
+      "description": "1-2 sentence description for the XLSX detail tab",
       "affected_vendors": ["vendor1", "vendor2"],
       "current_spend_usd": <float>,
       "savings_low_usd": <float>,
       "savings_high_usd": <float>,
-      "savings_rationale": "...",
+      "savings_rationale": "one sentence: how the saving was calculated",
+      "savings_confidence": "high | medium | low",
+      "savings_confidence_rationale": "one sentence: why this confidence level",
       "implementation_steps": ["step one ≤12 words", "step two ≤12 words"],
       "timeline": "...",
       "risks": "single short clause ≤15 words"
@@ -152,6 +162,77 @@ def _build_synthesis_prompt(
 
     today = date.today().isoformat()
 
+    # ── Build pre-ranked candidate list ──────────────────────────────────────
+    # Deterministically rank every actionable opportunity by estimated dollar
+    # impact BEFORE calling Claude. This makes Top 3 selection stable across
+    # runs — Claude writes titles/descriptions but cannot change the ranking.
+
+    candidates: list[dict] = []
+
+    # 1. Consolidate groups: sum spend across all vendors flagged for the same target
+    consolidate_groups: dict[str, list] = {}
+    for c in classifications:
+        if c.get("recommendation") == "Consolidate":
+            note = c.get("recommendation_note", "").lower()
+            cost = cost_map.get(c["vendor_name"], 0)
+            # Use first 40 chars of note as grouping key (vendors referencing the
+            # same duplicate will share a common note prefix)
+            key = note[:40].strip() or c["vendor_name"]
+            consolidate_groups.setdefault(key, []).append(
+                {"vendor_name": c["vendor_name"], "cost": cost, "note": c.get("recommendation_note", "")}
+            )
+    for key, group in consolidate_groups.items():
+        combined = sum(v["cost"] for v in group)
+        if combined > 0:
+            candidates.append({
+                "type": "Consolidate",
+                "vendors": [v["vendor_name"] for v in group],
+                "combined_spend": combined,
+                "score": combined,
+                "note": group[0]["note"],
+            })
+
+    # 2. Multi-vendor Optimize groups (same dept, clearly overlapping services)
+    for dept, vlist in optimize_by_dept.items():
+        if len(vlist) < 2:
+            continue
+        dept_spend = sum(cost_map.get(v["vendor_name"], 0) for v in vlist)
+        if dept_spend < 50_000:
+            continue  # not material enough
+        candidates.append({
+            "type": "Optimize-Group",
+            "department": dept,
+            "vendors": [v["vendor_name"] for v in
+                        sorted(vlist, key=lambda x: cost_map.get(x["vendor_name"], 0), reverse=True)],
+            "combined_spend": dept_spend,
+            "score": dept_spend,
+        })
+
+    # 3. Single high-spend Optimize vendors (renegotiation opportunities)
+    for c in sorted(classifications, key=lambda x: cost_map.get(x["vendor_name"], 0), reverse=True):
+        if c.get("recommendation") == "Optimize" and cost_map.get(c["vendor_name"], 0) >= 100_000:
+            candidates.append({
+                "type": "Optimize-Single",
+                "vendors": [c["vendor_name"]],
+                "combined_spend": cost_map.get(c["vendor_name"], 0),
+                "score": cost_map.get(c["vendor_name"], 0),
+            })
+
+    # Sort by score descending and take top 10 as the bounded selection pool
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    top_candidates = candidates[:10]
+
+    candidate_lines = []
+    for rank, cand in enumerate(top_candidates, 1):
+        vendors_str = ", ".join(cand["vendors"][:4])
+        if len(cand["vendors"]) > 4:
+            vendors_str += f" (+{len(cand['vendors'])-4} more)"
+        candidate_lines.append(
+            f"  {rank}. [{cand['type']}] {vendors_str} | "
+            f"${cand['combined_spend']:,.0f} combined spend"
+            + (f" | Note: {cand.get('note','')[:80]}" if cand.get("note") else "")
+        )
+
     prompt = f"""Analyze this vendor spend data and produce the Top 3 opportunities \
 and executive memo as specified.
 
@@ -169,19 +250,17 @@ SPEND BY DEPARTMENT
 TOP 30 VENDORS BY SPEND
 {chr(10).join(top_lines)}
 
+RANKED_CANDIDATES (your Top 3 must come from this list, ordered by spend impact)
+{chr(10).join(candidate_lines) if candidate_lines else '  (none identified)'}
+
 ALL CONSOLIDATE-FLAGGED VENDORS ({len(consolidate_vendors)} total)
 {chr(10).join(consolidate_lines) if consolidate_lines else '  (none flagged)'}
 
-OPTIMIZE VENDORS GROUPED BY DEPARTMENT
-(Multiple Optimize vendors in the same department often signal a consolidation \
-opportunity even if not individually flagged as Consolidate. Review for overlap.)
-{chr(10).join(optimize_group_lines) if optimize_group_lines else '  (none)'}
-
-Use this data to identify the three highest-impact opportunities. \
-Prioritize by dollar impact. Consolidation opportunities across multiple Optimize \
-vendors in the same department are valid — treat them as Consolidate opportunities \
-if the vendors clearly provide overlapping services. Be specific about which vendors \
-to act on and why."""
+Select the Top 3 opportunities from RANKED_CANDIDATES in order. For each, provide \
+an executive-quality title, savings estimate, confidence rating, and action steps. \
+Savings for "high" confidence items should match the combined spend of eliminated \
+duplicates. Savings for "medium" items should use 10–20% of combined spend as the \
+realistic negotiation range."""
 
     return prompt
 
