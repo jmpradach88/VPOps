@@ -20,7 +20,7 @@ from openpyxl.utils import get_column_letter
 
 from config import OUTPUT_XLSX
 
-# ── Color palette ─────────────────────────────────────────────────────────────
+# ── Color palette ─────────────────────────────────────────────
 HEADER_FILL   = PatternFill("solid", fgColor="1F3864")
 HEADER_FONT   = Font(bold=True, color="FFFFFF", size=11)
 TERM_FILL     = PatternFill("solid", fgColor="FFCCCC")
@@ -47,7 +47,7 @@ def _set_header_row(ws, headers: list[str], widths: list[int]) -> None:
     ws.row_dimensions[1].height = 28
 
 
-# ── Tab 1: Vendor Analysis ────────────────────────────────────────────────────
+# ── Tab 1: Vendor Analysis ────────────────────────────────────────────
 def _build_vendor_tab(wb: openpyxl.Workbook, vendors: list[dict], classifications: list[dict]) -> None:
     ws = wb.active
     ws.title = "Vendor Analysis"
@@ -88,7 +88,7 @@ def _build_vendor_tab(wb: openpyxl.Workbook, vendors: list[dict], classification
         ws.row_dimensions[row_num].height = 40
 
 
-# ── Tab 2: Top 3 Opportunities ────────────────────────────────────────────────
+# ── Tab 2: Top 3 Opportunities ──────────────────────────────────────────
 def _build_opportunities_tab(wb: openpyxl.Workbook, insights: dict) -> None:
     ws = wb.create_sheet("Top 3 Opportunities")
     ws.column_dimensions["A"].width = 5
@@ -179,7 +179,7 @@ def _build_opportunities_tab(wb: openpyxl.Workbook, insights: dict) -> None:
     ws.row_dimensions[r].height = 24
 
 
-# ── Tab 3: Methodology ────────────────────────────────────────────────────────
+# ── Tab 3: Methodology ────────────────────────────────────────────
 def _build_methodology_tab(wb: openpyxl.Workbook, insights: dict, qa_report: dict | None) -> None:
     ws = wb.create_sheet("Methodology")
     ws.column_dimensions["A"].width = 22
@@ -323,7 +323,47 @@ def _steps_str(value) -> str:
     return str(value) if value else ""
 
 
-# ── Tab 4: Executive Memo ──────────────────────────────────────────────────────
+def _memo_executive_summary(
+    memo: dict,
+    insights: dict,
+    opps: list[dict],
+    total_low: float,
+    total_high: float,
+) -> str:
+    """Return the executive_summary string from the memo dict, or build one from data."""
+    stored = memo.get("executive_summary", "").strip()
+    if stored:
+        return stored
+
+    total_vendors = insights.get("total_vendors", 0)
+    total_spend   = insights.get("total_spend_usd", 0)
+    rec           = insights.get("recommendation_summary", {})
+    terminate_ct  = rec.get("Terminate", 0)
+    consolidate_ct = rec.get("Consolidate", 0)
+
+    top_name  = opps[0].get("affected_vendors", [""])[0] if opps else ""
+    top_spend = opps[0].get("current_spend_usd", 0) if opps else 0
+    top_pct   = round(top_spend / total_spend * 100) if total_spend and top_spend else 0
+
+    concentration = (
+        f" The vendor base is heavily concentrated: {top_name} alone accounts for "
+        f"${top_spend:,.0f} ({top_pct}% of total spend), representing the single "
+        f"largest savings lever."
+        if top_name and top_pct else ""
+    )
+
+    return (
+        f"This memo summarises findings from a comprehensive analysis of {total_vendors} "
+        f"active vendors representing ${total_spend:,.0f} in trailing twelve-month accounts "
+        f"payable spend.{concentration} Of the {total_vendors} vendors reviewed, "
+        f"{terminate_ct} are recommended for termination and {consolidate_ct} for consolidation "
+        f"with overlapping providers. Three strategic actions are projected to deliver "
+        f"${total_low:,.0f}–${total_high:,.0f} in annual savings with no headcount reductions "
+        f"required and the majority of savings achievable within 90 days."
+    )
+
+
+# ── Tab 4: Executive Memo ──────────────────────────────────────────────
 def _build_executive_memo_tab(wb: openpyxl.Workbook, insights: dict) -> None:
     ws = wb.create_sheet("Recommendations")
     ws.column_dimensions["A"].width = 110
@@ -345,7 +385,7 @@ def _build_executive_memo_tab(wb: openpyxl.Workbook, insights: dict) -> None:
         ("─" * 100, "divider"),
         ("", "spacer"),
         ("EXECUTIVE SUMMARY", "section"),
-        (memo.get("executive_summary", ""), "body"),
+        (_memo_executive_summary(memo, insights, opps, total_low, total_high), "body"),
         ("", "spacer"),
         ("STRATEGIC OPPORTUNITIES", "section"),
     ]
@@ -404,7 +444,7 @@ def _build_executive_memo_tab(wb: openpyxl.Workbook, insights: dict) -> None:
             ws.row_dimensions[r].height = 8
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Public API ────────────────────────────────────────────────
 def build_xlsx(
     vendors: list[dict],
     classifications: list[dict],

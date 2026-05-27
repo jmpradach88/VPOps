@@ -72,6 +72,7 @@ Return a single JSON object with this exact schema:
   ],
   "executive_memo": {
     "from": "VP of Operations",
+    "executive_summary": "2-3 sentence summary: scope, key finding, total savings opportunity",
     "immediate_actions": [
       "action one ≤12 words",
       "action two ≤12 words",
@@ -162,7 +163,7 @@ def _build_synthesis_prompt(
 
     today = date.today().isoformat()
 
-    # ── Build pre-ranked candidate list ──────────────────────────────────────
+    # ── Build pre-ranked candidate list ───────────────────────────────────────
     # Deterministically rank every actionable opportunity by estimated dollar
     # impact BEFORE calling Claude. This makes Top 3 selection stable across
     # runs — Claude writes titles/descriptions but cannot change the ranking.

@@ -49,7 +49,7 @@ def check_cross_batch_consistency(
         optimize_count  = recs.count("Optimize")
         total           = len(vendors)
 
-        # ── 1. Terminate storm ────────────────────────────────────────────────
+        # ── 1. Terminate storm ────────────────────────────────────────────
         if total >= 4 and optimize_count > 0 and (terminate_count / total) > 0.5:
             for v in vendors:
                 if v.get("recommendation") == "Terminate":
@@ -191,10 +191,21 @@ def validate(vendors: list[dict], classifications: list[dict]) -> dict:
 
     cross_batch_anomalies = check_cross_batch_consistency(classifications, cost_map)
 
+    # High-spend Terminate items above $50K require explicit justification — they
+    # almost always indicate a data-quality or classification error and should
+    # block an unconditional "passed" status until a human reviews them.
+    HARD_TERMINATE_THRESHOLD = 50_000
+    unreviewed_high_terminate = [
+        v for v in high_spend_terminate
+        if v["cost_usd"] >= HARD_TERMINATE_THRESHOLD
+        and not v.get("recommendation_note", "").strip()
+    ]
+
     passed = (
         coverage >= 0.98
         and not invalid_depts
         and not invalid_recs
+        and not unreviewed_high_terminate
     )
 
     return {
